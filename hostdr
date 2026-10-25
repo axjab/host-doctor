@@ -320,8 +320,17 @@ check_mount() {
 }
 
 render() {
-    local report=$1 section='' title state label value marker pad
-    local padding
+    local report=$1 section='' title state label value marker tint pad padding
+    local ok_count warn_count fail_count
+    local green='' cyan='' yellow='' red='' reset=''
+
+    if [[ -t 1 && -z ${NO_COLOR:-} ]]; then
+        green=$'\033[32m'
+        cyan=$'\033[36m'
+        yellow=$'\033[33m'
+        red=$'\033[31m'
+        reset=$'\033[0m'
+    fi
 
     cat <<'EOF'
 
@@ -342,18 +351,27 @@ EOF
             section=$title
         fi
         case "$state" in
-            ok|info) marker='●' ;;
-            warn)    marker='○' ;;
-            fail)    marker='✖' ;;
+            ok)   marker='●'; tint=$green ;;
+            info) marker='●'; tint=$cyan ;;
+            warn) marker='○'; tint=$yellow ;;
+            fail) marker='●'; tint=$red ;;
         esac
         pad=$(( 24 - ${#label} ))
         (( pad > 0 )) || pad=1
         printf -v padding '%*s' "$pad" ''
-        printf '    %s %s %s %s\n' "$marker" "$label" "${padding// /·}" "$value"
+        printf '    %s%s%s %s %s %s\n' "$tint" "$marker" "$reset" "$label" "${padding// /·}" "$value"
     done < <(jq -r '.checks[] | [.section,.status,.label,.value] | @tsv' <<< "$report")
-    printf '\n  ──────────────────────────────────────\n'
-    jq -r '"  \(.summary.fail) failure(s), \(.summary.warn) warning(s), \(.summary.ok) ok, \(.summary.info) info"' \
-        <<< "$report"
+
+    # DMS-style footer: informational observations count as displayed OK entries.
+    IFS=$'\t' read -r ok_count warn_count fail_count < <(
+        jq -r '[.summary.ok + .summary.info, .summary.warn, .summary.fail] | @tsv' <<< "$report"
+    )
+    printf '\n  ──────────────────────────────────────\n  '
+    if (( fail_count > 0 )); then
+        printf '%s%s failure(s)%s, ' "$red" "$fail_count" "$reset"
+    fi
+    printf '%s%s warning(s)%s, %s%s ok%s\n' \
+        "$yellow" "$warn_count" "$reset" "$green" "$ok_count" "$reset"
 }
 
 if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
