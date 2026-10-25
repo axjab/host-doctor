@@ -1,0 +1,361 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+# --- Configuration ----------------------------------------------------------
+readonly HOSTDR_VERSION='1.0.0'
+readonly MULLVAD_URL='https://am.i.mullvad.net/json'
+readonly HTTPS_TEST_URL='https://www.debian.org/'
+readonly DNS_TEST_HOST='www.debian.org'
+readonly CONNECT_TIMEOUT=3
+readonly REQUEST_TIMEOUT=8
+readonly REQUIRE_MULLVAD=true
+readonly DISK_WARN_PERCENT=80
+readonly DISK_FAIL_PERCENT=95
+readonly -a REQUIRED_SERVICES=(ssh)
+readonly -a MONITORED_MOUNTS=(/)
+
+main() {
+    local format=pretty report mullvad='' ssh_config='' service mount
+    local -a checks=()
+
+    case "${1:-}" in
+        '') ;;
+        --json) format=json ;;
+        --help|-h) usage; return 0 ;;
+        *) printf 'Usage: hostdr [--json|--help]\n' >&2; return 2 ;;
+    esac
+    if (( $# > 1 )); then
+        printf 'Usage: hostdr [--json|--help]\n' >&2
+        return 2
+    fi
+
+    if ! command -v jq >/dev/null 2>&1; then
+        printf '%s\n' '{"tool":"hostdr","error":"jq is required","checks":[],"summary":{"ok":0,"warn":0,"fail":1,"info":0}}'
+        return 2
+    fi
+
+    # An unavailable or malformed response must never become proof of VPN safety.
+    mullvad=$(fetch_mullvad) || mullvad=''
+    ssh_config=$(read_sshd_config) || ssh_config=''
+
+    checks+=("$(check_os)" "$(check_arch)" "$(check_hostname)" "$(check_uptime)")
+    checks+=("$(check_dns)" "$(check_https)" "$(check_public_ip "$mullvad")")
+    checks+=("$(check_mullvad "$mullvad")" "$(check_location City city "$mullvad")")
+    checks+=("$(check_location Country country "$mullvad")")
+    checks+=("$(check_firewall)" "$(check_ssh_password "$ssh_config")")
+    checks+=("$(check_ssh_root "$ssh_config")" "$(check_auto_updates)")
+    checks+=("$(check_upgrade_timer)")
+
+    for service in "${REQUIRED_SERVICES[@]}"; do
+        checks+=("$(check_service "$service")")
+    done
+    for mount in "${MONITORED_MOUNTS[@]}"; do
+        checks+=("$(check_disk "$mount")" "$(check_mount "$mount")")
+    done
+
+    report=$(printf '%s\n' "${checks[@]}" | jq -s --arg version "$HOSTDR_VERSION" \
+        --arg host "$(uname -n)" --arg generated_at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" '
+        {
+            tool: "hostdr", version: $version, hostname: $host, generated_at: $generated_at,
+            checks: ., summary: {
+                ok:   (map(select(.status == "ok"))   | length),
+                warn: (map(select(.status == "warn")) | length),
+                fail: (map(select(.status == "fail")) | length),
+                info: (map(select(.status == "info")) | length)
+            }
+        }
+    ')
+
+    if [[ $format == json ]]; then
+        printf '%s\n' "$report"
+    else
+        render "$report"
+    fi
+    if jq -e '.summary.fail > 0' >/dev/null <<< "$report"; then
+        return 1
+    fi
+}
+
+usage() {
+    cat <<'EOF'
+Usage: hostdr [--json|--help]
+  --json   Print the canonical JSON report instead of terminal formatting
+  --help   Show this help
+Exit: 0 = healthy/warnings only, 1 = failed checks, 2 = usage/dependency error
+EOF
+}
+
+# Every check emits exactly one JSON object. The renderer never runs checks.
+check() {
+    jq -nc --arg section "$1" --arg label "$2" --arg status "$3" --arg value "$4" \
+        '{section: $section, label: $label, status: $status, value: $value}'
+}
+
+fetch_mullvad() {
+    local response
+    response=$(curl -fsS --connect-timeout "$CONNECT_TIMEOUT" --max-time "$REQUEST_TIMEOUT" \
+        "$MULLVAD_URL" 2>/dev/null) || return 1
+    jq -ec 'select(type == "object" and (.mullvad_exit_ip | type == "boolean"))' \
+        <<< "$response"
+}
+
+json_text() {
+    local payload=${2:-}
+    [[ -n $payload ]] || payload='{}'
+    jq -r --arg key "$1" '.[$key] | if type == "string" and length > 0 then . else "Unknown" end' \
+        <<< "$payload"
+}
+
+check_os() {
+    local name='Unknown'
+    if [[ -r /etc/os-release ]]; then
+        name=$( . /etc/os-release; printf '%s' "${PRETTY_NAME:-Unknown}" )
+    fi
+    check System 'Operating System' info "$name"
+}
+
+check_arch() {
+    local arch
+    arch=$(dpkg --print-architecture 2>/dev/null) || arch=$(uname -m)
+    check System Architecture info "$arch"
+}
+
+check_hostname() { check System Hostname info "$(uname -n)"; }
+
+check_uptime() {
+    local result
+    result=$(uptime -p 2>/dev/null) || result='Unknown'
+    check System Uptime info "$result"
+}
+
+check_dns() {
+    if getent ahosts "$DNS_TEST_HOST" >/dev/null 2>&1; then
+        check Network DNS ok "Resolved $DNS_TEST_HOST"
+    else
+        check Network DNS fail "Cannot resolve $DNS_TEST_HOST"
+    fi
+}
+
+check_https() {
+    if curl -fsS -o /dev/null --connect-timeout "$CONNECT_TIMEOUT" \
+        --max-time "$REQUEST_TIMEOUT" "$HTTPS_TEST_URL" 2>/dev/null; then
+        check Network HTTPS ok 'Reachable'
+    else
+        check Network HTTPS fail 'Outbound HTTPS unavailable'
+    fi
+}
+
+check_public_ip() {
+    local ip
+    ip=$(json_text ip "$1")
+    if [[ $ip == Unknown ]]; then
+        check Network 'Public IP' warn 'Unavailable (Mullvad API)'
+    else
+        check Network 'Public IP' info "$ip"
+    fi
+}
+
+check_mullvad() {
+    local connected payload=${1:-}
+    [[ -n $payload ]] || payload='{}'
+    connected=$(jq -r '.mullvad_exit_ip | if type == "boolean" then tostring else "unknown" end' <<< "$payload")
+    case "$connected" in
+        true)  check Privacy Mullvad ok 'Connected (verified exit IP)' ;;
+        false) if [[ $REQUIRE_MULLVAD == true ]]; then
+                   check Privacy Mullvad fail 'Not connected'
+               else
+                   check Privacy Mullvad info 'Not connected (optional)'
+               fi ;;
+        *)     if [[ $REQUIRE_MULLVAD == true ]]; then
+                   check Privacy Mullvad fail 'Cannot verify connection'
+               else
+                   check Privacy Mullvad warn 'Cannot verify connection'
+               fi ;;
+    esac
+}
+
+check_location() {
+    local label=$1 key=$2 result
+    result=$(json_text "$key" "$3")
+    check Privacy "$label" info "$result"
+}
+
+check_firewall() {
+    local result
+    if command -v ufw >/dev/null 2>&1; then
+        result=$(ufw status 2>/dev/null) || result=''
+        if [[ $result == *'Status: active'* ]]; then
+            check Security Firewall ok 'UFW active'
+            return
+        fi
+    fi
+    if command -v firewall-cmd >/dev/null 2>&1 && \
+       [[ $(firewall-cmd --state 2>/dev/null || :) == running ]]; then
+        check Security Firewall ok 'firewalld running'
+        return
+    fi
+    if command -v nft >/dev/null 2>&1; then
+        if result=$(nft -j list ruleset 2>/dev/null); then
+            if jq -e '[.nftables[]? | .chain? | select(.hook == "input" and .policy == "drop") | .family]
+                | index("inet") != null or (index("ip") != null and index("ip6") != null)' \
+                >/dev/null 2>&1 <<< "$result"; then
+                check Security Firewall ok 'nftables input policy: drop'
+            else
+                check Security Firewall warn 'No verified default-deny input policy'
+            fi
+        else
+            check Security Firewall warn 'Cannot inspect nftables (try sudo)'
+        fi
+    else
+        check Security Firewall fail 'No active supported firewall detected'
+    fi
+}
+
+read_sshd_config() {
+    local executable
+    if command -v sshd >/dev/null 2>&1; then
+        executable=$(command -v sshd)
+    elif [[ -x /usr/sbin/sshd ]]; then
+        executable=/usr/sbin/sshd
+    else
+        return 1
+    fi
+    "$executable" -T 2>/dev/null
+}
+
+ssh_setting() { awk -v key="$1" '$1 == key {print $2; exit}' <<< "$2"; }
+
+check_ssh_password() {
+    local setting
+    setting=$(ssh_setting passwordauthentication "$1")
+    case "$setting" in
+        no)  check Security 'SSH Password Auth' ok 'Disabled (default context)' ;;
+        yes) check Security 'SSH Password Auth' fail 'Enabled (default context)' ;;
+        *)   check Security 'SSH Password Auth' warn 'Unable to inspect' ;;
+    esac
+}
+
+check_ssh_root() {
+    local setting
+    setting=$(ssh_setting permitrootlogin "$1")
+    case "$setting" in
+        no) check Security 'SSH Root Login' ok 'Disabled (default context)' ;;
+        yes) check Security 'SSH Root Login' fail 'Unrestricted (default context)' ;;
+        prohibit-password|forced-commands-only)
+            check Security 'SSH Root Login' warn "$setting (default context)" ;;
+        *) check Security 'SSH Root Login' warn 'Unable to inspect' ;;
+    esac
+}
+
+check_auto_updates() {
+    local setting value
+    if ! dpkg-query -W -f='${Status}' unattended-upgrades 2>/dev/null | grep -qx 'install ok installed'; then
+        check Security 'Automatic Updates' fail 'unattended-upgrades not installed'
+        return
+    fi
+    setting=$(apt-config shell DAYS APT::Periodic::Unattended-Upgrade 2>/dev/null) || setting=''
+    value=${setting#DAYS=}
+    value=${value#\'}
+    value=${value%\'}
+    if [[ $value =~ ^[1-9][0-9]*$ ]]; then
+        check Security 'Automatic Updates' ok "Enabled (every $value day(s))"
+    else
+        check Security 'Automatic Updates' fail 'Not enabled in APT configuration'
+    fi
+}
+
+check_upgrade_timer() {
+    local state
+    state=$(systemctl is-enabled apt-daily-upgrade.timer 2>/dev/null) || state=''
+    if [[ $state == enabled ]]; then
+        check Security 'APT Upgrade Timer' ok Enabled
+    else
+        check Security 'APT Upgrade Timer' warn "${state:-Unavailable}"
+    fi
+}
+
+check_service() {
+    local service=$1 active enabled
+    active=$(systemctl is-active "$service" 2>/dev/null) || active='inactive'
+    enabled=$(systemctl is-enabled "$service" 2>/dev/null) || enabled='disabled'
+    if [[ $active != active ]]; then
+        check Services "$service" fail "$active, $enabled"
+    elif [[ $enabled != enabled && $enabled != static ]]; then
+        check Services "$service" warn "$active, $enabled"
+    else
+        check Services "$service" ok "$active, $enabled"
+    fi
+}
+
+check_disk() {
+    local mount=$1 used
+    if [[ ! -d $mount ]]; then
+        check Storage "$mount usage" fail 'Mount path missing'
+        return
+    fi
+    used=$(LC_ALL=C df -P -- "$mount" 2>/dev/null | awk 'END {gsub(/%/, "", $5); print $5}') || used=''
+    if [[ ! $used =~ ^[0-9]+$ ]]; then
+        check Storage "$mount usage" warn 'Cannot measure capacity'
+    elif (( used >= DISK_FAIL_PERCENT )); then
+        check Storage "$mount usage" fail "$used% used"
+    elif (( used >= DISK_WARN_PERCENT )); then
+        check Storage "$mount usage" warn "$used% used"
+    else
+        check Storage "$mount usage" ok "$used% used"
+    fi
+}
+
+check_mount() {
+    local mount=$1 opts
+    if [[ ! -d $mount ]]; then
+        check Storage "$mount filesystem" fail 'Mount path missing'
+        return
+    fi
+    opts=$(findmnt -no OPTIONS --target "$mount" 2>/dev/null) || opts=''
+    case ",$opts," in
+        *,ro,*) check Storage "$mount filesystem" fail 'Read-only' ;;
+        *,rw,*) check Storage "$mount filesystem" ok 'Read-write' ;;
+        *)      check Storage "$mount filesystem" warn 'Unable to inspect' ;;
+    esac
+}
+
+render() {
+    local report=$1 section='' title state label value marker pad
+    local padding
+
+    cat <<'EOF'
+
+██╗  ██╗ ██████╗ ███████╗████████╗██████╗ ██████╗
+██║  ██║██╔═══██╗██╔════╝╚══██╔══╝██╔══██╗██╔══██╗
+███████║██║   ██║███████╗   ██║   ██║  ██║██████╔╝
+██╔══██║██║   ██║╚════██║   ██║   ██║  ██║██╔══██╗
+██║  ██║╚██████╔╝███████║   ██║   ██████╔╝██║  ██║
+╚═╝  ╚═╝ ╚═════╝ ╚══════╝   ╚═╝   ╚═════╝ ╚═╝  ╚═╝
+
+ Host Health & Security Check
+
+──────────────────────────────────────
+EOF
+    while IFS=$'\t' read -r title state label value; do
+        if [[ $title != "$section" ]]; then
+            printf '\n  %s\n' "$title"
+            section=$title
+        fi
+        case "$state" in
+            ok|info) marker='●' ;;
+            warn)    marker='○' ;;
+            fail)    marker='✖' ;;
+        esac
+        pad=$(( 24 - ${#label} ))
+        (( pad > 0 )) || pad=1
+        printf -v padding '%*s' "$pad" ''
+        printf '    %s %s %s %s\n' "$marker" "$label" "${padding// /·}" "$value"
+    done < <(jq -r '.checks[] | [.section,.status,.label,.value] | @tsv' <<< "$report")
+    printf '\n  ──────────────────────────────────────\n'
+    jq -r '"  \(.summary.fail) failure(s), \(.summary.warn) warning(s), \(.summary.ok) ok, \(.summary.info) info"' \
+        <<< "$report"
+}
+
+if [[ ${BASH_SOURCE[0]} == "$0" ]]; then
+    main "$@"
+fi
